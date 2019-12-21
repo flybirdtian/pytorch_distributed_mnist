@@ -4,6 +4,8 @@ import argparse
 import random
 import time
 import warnings
+import os
+import shutil
 
 import torch
 import torch.nn as nn
@@ -14,6 +16,7 @@ from torch.utils import data
 from torchvision import datasets, transforms
 import torch.multiprocessing as mp
 
+best_acc = 0
 
 def distributed_is_initialized():
     if dist.is_available():
@@ -70,17 +73,6 @@ class Trainer(object):
         self.train_loader = train_loader
         self.test_loader = test_loader
         self.device = device
-
-    def fit(self, epochs):
-        for epoch in range(1, epochs + 1):
-            train_loss, train_acc = self.train()
-            test_loss, test_acc = self.evaluate()
-
-            print(
-                'Epoch: {}/{},'.format(epoch, epochs),
-                'train loss: {}, train acc: {},'.format(train_loss, train_acc),
-                'test loss: {}, test acc: {}.'.format(test_loss, test_acc),
-            )
 
     def train(self):
         self.model.train()
@@ -145,12 +137,14 @@ class MNISTDataLoader(data.DataLoader):
         dataset = datasets.MNIST(
             root, train=train, transform=transform, download=True)
 
-        sampler = None
+        self.train = train
+
+        self.sampler = None
         if train and distributed_is_initialized():
-            sampler = data.DistributedSampler(dataset)
+            self.sampler = data.DistributedSampler(dataset)
 
         if train:
-            shuffle = (sampler is None)
+            shuffle = (self.sampler is None)
         else:
             shuffle = False
 
@@ -159,29 +153,67 @@ class MNISTDataLoader(data.DataLoader):
             dataset,
             batch_size=batch_size,
             shuffle=shuffle,
-            sampler=sampler, num_workers=num_workers, pin_memory=False
+            sampler=self.sampler, num_workers=num_workers, pin_memory=False
         )
 
+    def set_sample_epoch(self, epoch=0):
+        if self.train and self.sampler is not None:
+            self.sampler.set_epoch(epoch)
 
 def run(args):
+    global best_acc
+
     # initialize the process group
     dist.init_process_group(
         backend=args.backend, init_method=args.init_method, world_size=args.world_size, rank=args.rank)
 
-    rank = dist.get_rank()
-    print("rank: {}, device count: {}, workers:{}".format(
-        rank, torch.cuda.device_count(), args.workers))
+    ngpus = torch.cuda.device_count()
+    # When using a single GPU per process and per
+    # DistributedDataParallel, we need to divide the batch size
+    # ourselves based on the total number of GPUs we have
+    args.batch_size = int(args.batch_size / ngpus)
+    args.workers = int((args.workers + ngpus - 1) / ngpus)
 
-    device_id = rank
-    device = torch.device("cuda", device_id)
+    # rank = dist.get_rank()
+    rank = args.rank
+
+    gpu_id = rank
+    device = torch.device("cuda", gpu_id)
+
+    print("rank: {}, device count: {}, workers:{}".format(rank, ngpus, args.workers))
 
     model = Net()
     if distributed_is_initialized():
         model.cuda(device)
         model = nn.parallel.DistributedDataParallel(
-            model, device_ids=[device_id])
+            model, device_ids=[gpu_id])
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    # optimizer = torch.optim.SGD(model.parameters(), args.lr,
+    #                             momentum=args.momentum,
+    #                             weight_decay=args.weight_decay)
+    
+    # optionally resume from a checkpoint
+    if args.resume:
+        if os.path.isfile(args.resume):
+            print("=> loading checkpoint '{}'".format(args.resume))
+
+            # Map model to be loaded to current gpu.
+            checkpoint = torch.load(args.resume, map_location=device)
+
+            args.start_epoch = checkpoint['epoch']
+
+            best_acc = checkpoint['best_acc']
+            print("best_acc: {}".format(best_acc))
+
+            model.load_state_dict(checkpoint['state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            print("=> loaded checkpoint '{}' (epoch {})"
+                  .format(args.resume, checkpoint['epoch']))
+        else:
+            print("=> no checkpoint found at '{}'".format(args.resume))
+
+    cudnn.benchmark = True
 
     train_loader = MNISTDataLoader(
         args.root, args.batch_size, num_workers=args.workers, train=True)
@@ -189,14 +221,59 @@ def run(args):
         args.root, args.batch_size, num_workers=args.workers, train=False)
 
     trainer = Trainer(model, optimizer, train_loader, test_loader, device)
-    trainer.fit(args.epochs)
 
+    if args.evaluate:
+        test_loss, test_acc = trainer.evaluate()
+        print('test loss: {}, test acc: {}.'.format(test_loss, test_acc))
+        return
+
+    for epoch in range(args.start_epoch, args.epochs):
+        train_loader.set_sample_epoch(epoch)
+        adjust_learning_rate(optimizer, epoch, args)
+
+        # train for one epoch
+        train_loss, train_acc = trainer.train()
+        test_loss, test_acc = trainer.evaluate()
+
+        print(
+            'Epoch: {}/{},'.format(epoch, args.epochs),
+            'train loss: {}, train acc: {},'.format(train_loss, train_acc),
+            'test loss: {}, test acc: {}.'.format(test_loss, test_acc)
+        )
+
+        # remember best acc and save checkpoint
+        is_best = test_acc.accuracy > best_acc
+        best_acc = max(test_acc.accuracy, best_acc)
+
+        # only save checkpoints in the first gpu
+        if args.rank == 0:
+            save_checkpoint({
+                'epoch': epoch + 1,
+                'state_dict': model.state_dict(),
+                'best_acc': best_acc,
+                'optimizer' : optimizer.state_dict(),
+            }, is_best, epoch)
+
+def adjust_learning_rate(optimizer, epoch, args):
+    """Sets the learning rate to the initial LR decayed by 10 every 10 epochs"""
+    lr = args.lr * (0.1 ** (epoch // 10))
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+
+def save_checkpoint(state, is_best, epoch):
+    chk_dir = 'checkpoints'
+    if not os.path.exists(chk_dir):
+        os.makedirs(chk_dir)
+    filename=os.path.join(chk_dir, 'checkpoint_{}.pth.tar'.format(epoch))
+    torch.save(state, filename)
+    if is_best:
+        bestfilename = os.path.join(chk_dir, 'model_best.pth.tar')
+        shutil.copyfile(filename, bestfilename)
 
 def run_spawn(proc_id, args):
     # for single node with multiple gpus, if using torch.multiprocessing.spawn, rank= process_id
     args.rank = proc_id
     run(args)
-
 
 def run_dist_launch(args):
      # for single node with multiple gpus, if using torch.distributed.launch, rank= local_rank
@@ -222,15 +299,15 @@ if __name__ == '__main__':
                         'total batch size of all GPUs on the current node '
                         'when use Distributed Data Parallel')
 
-    parser.add_argument('-lr', '--learning-rate', type=float, default=1e-3)
+    parser.add_argument('--lr', '--learning-rate', default=1e-3, type=float,
+                    metavar='LR', help='initial learning rate', dest='lr')
+
     parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
                         help='momentum')
     parser.add_argument('--wd', '--weight-decay', default=1e-4, type=float,
                         metavar='W', help='weight decay (default: 1e-4)',
                         dest='weight_decay')
 
-    parser.add_argument('-p', '--print-freq', default=10, type=int,
-                        metavar='N', help='print frequency (default: 10)')
     parser.add_argument('--resume', default='', type=str, metavar='PATH',
                         help='path to latest checkpoint (default: none)')
     parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
@@ -263,6 +340,7 @@ if __name__ == '__main__':
         random.seed(args.seed)
         torch.manual_seed(args.seed)
         cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
         warnings.warn('You have chosen to seed training. '
                       'This will turn on the CUDNN deterministic setting, '
                       'which can slow down your training considerably! '
@@ -271,12 +349,6 @@ if __name__ == '__main__':
 
     ngpus = torch.cuda.device_count()
     assert(args.world_size == ngpus)
-
-    # When using a single GPU per process and per
-    # DistributedDataParallel, we need to divide the batch size
-    # ourselves based on the total number of GPUs we have
-    args.batch_size = int(args.batch_size / ngpus)
-    args.workers = int((args.workers + ngpus - 1) / ngpus)
 
     # way 1: using torch.distributed.launch, then in a terminal, run:
     # CUDA_VISIBLE_DEVICES=0,1,2,3 python -m torch.distributed.launch --nproc_per_node=4 multi_proc_single_gpu.py --world-size 4 --workers 4
