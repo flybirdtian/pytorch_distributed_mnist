@@ -49,7 +49,7 @@ You need to download Mnist dataset before running and put it to 'data' folder in
 
 # Resume training:
   add resume arguments based on traning command:
-  --resume [path-to-checkpoint]
+  > [traning-command] --resume [path-to-checkpoint]
 
 # Evaluate:
    In evaluate, you only need to test on a single GPU
